@@ -1,14 +1,13 @@
 #!/bin/bash
-set -
+# Basic script to purge multiple Oracle tables by batchs of rows
+# Ex: 
+#   $ . purge_oracle
+#   $ echo "my_table where field1 = 'foo' and updated < sysdate - 7
+#   other_table where field1 = 'bar' and updated < sysdate - 7" | purge_oracle
 
-log(){ echo `date '+%Y-%m-%d %H:%M:%S'` [`basename $0`] "$@"; logger -t `basename $0` -p user.$@; }
-error(){ log error "$@"; exit 1; }
-warn(){ log warn "$@"; }
-info(){ log info "$@"; }
+row_purged_per_iteration=2000
 
-test `whoami` = oracle || error This script must be started by the Oracle user
-
-max_days=15
+info(){ echo `date '+%Y-%m-%d %H:%M:%S'` [`basename $0`] "$@"; }
 
 cd `dirname $0`
 
@@ -24,11 +23,9 @@ EOS
   } 2>&1
 }
 
-row_purged_per_iteration=2000
-
 purge_oracle(){
  while read request; do
-  count=`sql "select count(*) from $request;"` || { log WARN "$request KO: $count"; continue; }
+  count=`sql "select count(*) from $request;"` || { info "$request KO: $count"; continue; }
   info "$count rows selected for request: $request"
   if test $count -gt 0; then
     nb_purge=`expr $count / $row_purged_per_iteration + 1`
@@ -39,21 +36,3 @@ purge_oracle(){
   fi
  done
 }
-
-max_days=15
-
-info "Purge the tables for each IS"
-for core_xml in `find /opt/eai/is/*/IntegrationServer/config/jdbc/function -name ISCoreAudit.xml`; do
-  pool=`grep connPool $core_xml | sed 's/.*Alias">//; s/<\/value.*//'`
-  core_xml_dir=`dirname $core_xml`
-  user=`grep userid $core_xml_dir/../pool/$pool.xml | sed 's/.*userid">//; s/<\/value.*//'`
-  echo
-  echo Purge of ISCoreAudit $user
-  sed "s/&1/$user/; s/&2/$max_days/" purge_oracle.data | purge_oracle
-done
-
-#info "Old purge for WMIS (to remove)"
-#sed "s/&1/WMIS/; s/&2/$max_days/" purge_oracle.data | purge_oracle
-
-info "Purge of the Total flows data"
-cat purge_oracle.flows | purge_oracle
