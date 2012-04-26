@@ -6,6 +6,9 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 
+/**
+ * Basic client to execute SQL requests and get a semi column seperated output
+ */
 public class OracleClient {
 	Connection con;
 	
