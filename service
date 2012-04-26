@@ -1,0 +1,458 @@
+#!/bin/bash
+set -o pipefail
+set -
+
+help(){ 
+  components=`grep "(){" $0 | egrep -v "^ *_|help" | sed 's/(){.*//' | xargs`
+  echo "Description: This script enables or disables the EAI service on one host.
+Usage: `basename $0` [component] stop|start|status
+	With component in: $components
+
+Ex: `basename $0` stop          Stop everything (in order to do a DRP for example)
+    `basename $0` oracle stop   Stop the Oracle database
+
+It includes:
+	- stopping/starting all the applications
+	- adding/removing the IP address(es) used by the applications
+	- mounting/unmounting the FS & NFS of the applications (killing any blocking process
+	- vary on / off the VGs (Volume Groups)
+	- exportvg after the varyoffvg & importvg before the varyonvg
+
+If it is executed on the first node, it also executes the action on the second node"
+}
+
+# Get env parameters like logical_host, etc
+. /opt/eai/scripts/ref
+
+test `whoami` != root && error "Use root"
+
+# Functions accepts stop|start|status as 1st argument except when they start with '_'
+
+_filesystems(){
+  cat /etc/filesystems | awk '
+BEGIN{a=""}{
+ if ($0 ~ /^\/.*:/) { 
+  print a; a=$0; gsub(/:/,"",a); 
+ }else{
+  b=$0;
+  gsub(/ |\t/,"",b);
+  a=a ";" b;
+ }
+}'
+}
+_is_type_mounted(){
+  _filesystems | grep type=$1 | sed 's/dev=//' | while IFS=";" read dir dev etc; do 
+    if test `mount | egrep -c " $dev "` -ne 1; then
+      info $dev is not mounted
+      return 1
+    fi
+  done
+}
+
+netmask=`ifconfig -a |grep $prod_ip | awk '{print $4}'` || error "get netmask in ifconfig -a"
+
+_add_ip(){
+  if ping $2 1024 1; then
+    ifconfig $1 | grep $2 || error "IP $2 pings"
+  fi
+  ifconfig $1 alias $2 netmask $netmask up || error "ifconfig $1 alias $2 netmask $netmask up"
+}
+_del_ip(){
+  ifconfig $1 | grep $2 || { warn No $2 found on $1; return; }
+  ifconfig $1 delete $2 || error "ifconfig $1 delete $2 KO"
+  ping $2 1024 1 && error "IP $2 pings" || echo "IP $2 doesn't ping"
+}
+ip(){
+ interface=`netstat -rn |grep default | head -1 | awk '{print $6}'`
+ info -c IP "$1 IP $logical_ip on interface $interface"
+ case $1 in
+  status) ifconfig $interface | grep $logical_ip && echo $logical_ip is up || warn logical_ip $logical_ip is not present;;
+  start) _add_ip $interface $logical_ip;;
+  stop) _del_ip $interface $logical_ip;;
+ esac
+}
+
+# Unmount the FS (kill any process still using the FS)
+_umount_kill(){
+  type=$1
+  umount -t $type 2>/var/tmp/umount_${type}_stderr && info "umount $type OK" && return
+  info "Can't unmount the $type, checking for process using it..."
+  cat /var/tmp/umount_${type}_stderr | while read line; do
+      fs=`echo $line | sed 's/^.*[: ]\(\/[a-zA-Z0-9_/]*\)[: ].*$/\1/'`
+      dir=`lsfs $fs |grep -v Nodename | awk '{print $3}'` || error "No FS $fs"
+      pids=`fuser -c $dir 2>/dev/null` || error "No user on $dir"
+      test `echo "$pids" | wc -w` -gt 0 || error "No process found using $fs"
+      info "$fs still used by process $pids. Killing the process"
+      kill $pids || error "kill $pids failed"
+      sleep 5
+      if umount $fs; then 
+        info "[umount -t $type] umount $fs OK"
+      else
+        kill -9 $pids
+        sleep 5
+        umount $fs && info "[umount -t $type] umount $fs OK" || error "[umount -t $type] umount $fs KO"
+      fi
+    done
+}
+
+# stop / start / status functions
+hpom(){
+ case $1 in
+  status) /usr/lpp/OV/bin/opctemplate -l |egrep -v "^$| List |----|  Type " | egrep "DBSPI|Oracle|EAI";;
+  start) hpom status | grep disabled | cut -d'"' -f2 | while read policy; do
+      /usr/lpp/OV/bin/opctemplate -e "$policy" && info -c HPOM "$policy up" || error "Enable of $policy failed"
+    done;;
+  stop) hpom status | grep enabled | cut -d'"' -f2 | while read policy; do
+      /usr/lpp/OV/bin/opctemplate -d "$policy" && info -c HPOM "$policy down" || error "Disable of $policy failed"
+    done;;
+ esac
+}
+
+is(){ test -d /opt/eai/is && su - eai -c "/opt/eai/scripts/wm_is $1 >/dev/stderr"; }
+james(){ 
+  test $1 = status && status=check || status=$1
+  test -d /opt/apache/james-2.3.2 && su - eai -c "/opt/apache/james-2.3.2/bin/phoenix.sh $status" | info -c james
+}
+_pelmon(){ 
+  pelmon_status=`su - peli_com -c "pelmon status"`
+  echo $pelmon_status
+  test `echo $pelmon_status | grep -c "$1"` -eq 1
+}
+interpel(){
+ test -d /opt/axway/interpel663/run_time && case $1 in
+  stop) su - peli_com -c "/opt/axway/interpel663/interpel $1";;
+  start) _pelmon stopped && su - peli_com -c "/opt/axway/interpel663/interpel $1";;
+  status) su - peli_com -c "/opt/axway/interpel663/interpel $1" | info -c interpel
+	_pelmon running;;
+ esac
+}
+_wait_for_pid(){
+  log_file="$1"
+  timeout=$2
+  interval=3
+
+  pid_on_file(){
+    _pid=`fuser $1 2>/dev/null`
+    test "x$_pid" != x && echo $_pid
+  }
+  unset pid
+  sec=0
+  while ! pid=`pid_on_file "$log_file"` && test $sec -lt $timeout; do
+    sec=`expr $sec + $interval`
+    sleep $interval
+  done
+  test -v pid && info "MWS pid is $pid" || error "No process present after executing $script"
+}
+_wait_for_log(){
+  log_file="$1"
+  log_started="$2"
+  timeout=$3
+  interval=10
+  nb_startlog(){
+    test -f $log_file || { echo 0; return; }
+    grep -c "$log_started" $log_file
+  }
+  init_nb_startlog=`nb_startlog`
+  retry=0
+  max_retries=`expr $timeout / $interval`
+  while true; do
+    # If the number of start logs decrease => the log file changed
+    test `nb_startlog` -lt $init_nb_startlog && nb_startlog_before=0
+    test `nb_startlog` -gt $init_nb_startlog && { info "Detected \"$log_started\" into $log_file"; break; }
+    retry=`expr $retry + 1`
+    test $retry -gt $max_retries && error "Not started after $retry retries ($log_file)"
+    test `expr $retry % 4` -eq 0 && info "$retry out of $max_retries. Waiting for \"$log_started\" in $log_file, last log: `tail -1 $log_file`"
+    sleep $interval
+  done
+}
+mws(){
+#  set -x
+  server_dir=/opt/eai/mws/MWS/server/default
+  test ! -d /opt/eai/mws/MWS && warn "No MWS folder" && return
+  mws_is_started(){
+    test -f $server_dir/temp/mws.pid || return 1
+    test x`cat $server_dir/temp/mws.pid` = x && return 2
+#    test `netstat -a | grep -c '*.8585'` -eq 1 || return 3
+    test `lsof | grep -c '*.8585 (LISTEN)' ` -eq 1 || return 3
+  }
+  case $1 in
+   stop) mws_is_started || { warn -c MWS "is not started"; return; }
+	su - eai -c "cd /opt/eai/mws/MWS/server/default/bin; ./shutdown.sh" | info -c MWS
+	_wait_for_log $server_dir/logs/_full_.log "Shutdown complete." 120;;
+   start) mws_is_started && warn -c MWS "is already be started" && return
+	su - eai -c "cd $server_dir/bin; ./startup.sh" | info -c MWS || error MWS
+	_wait_for_pid $server_dir/logs/_full_.log 20
+	_wait_for_log $server_dir/logs/_full_.log 'seconds to initialize' 2000
+	info -c MWS Started;;
+   status) info -c MWS "status: `test -f $server_dir/temp/mws.pid && ps -T $(cat $server_dir/temp/mws.pid) | grep -v PID`"
+     test `lsof | grep -c '*.8585'` -eq 1 && default_status="Started" || default_status="Not started"
+     info -c MWS `awk '{
+	  if ($0 ~ "Shutdown complete.") status="Stopped"; 
+	  if ($0 ~ "Logging configured successfully.") status="Starting"; 
+	  if ($0 ~ "seconds to initialize") status="Started"; 
+	}
+	END{print status}' status="$default_status" $server_dir/logs/_full_.log`
+     ;;
+  esac
+}
+brokermon(){ 
+ test -d /opt/eai/bs/Broker && case $1 in
+  stop)
+    su - eai -c "/opt/eai/bs/Broker/K45broker82 $1" | info -c brokermon;;
+  start) 
+    su - eai -c "/opt/eai/bs/Broker/S45broker82 $1" || error "S45broker82 $1 KO"
+    brokermon status;;
+  status) 
+    info "Check all brokers are ready"
+    for port in `grep '\.port' /opt/eai/bs/Broker/bin/awbrokermon.cfg |cut -d= -f2`; do
+      seconds=0; ok=0
+      while test $seconds -le 600; do
+        /opt/eai/bs/Broker/bin/broker_ping localhost:$port | info -c Broker$port && ok=1 && break
+        info "Broker localhost:$port not started after $seconds seconds"
+        seconds=`expr $seconds + 10`
+        sleep 10
+      done
+      test $ok -eq 1 || error "Broker localhost:$port KO"
+    done;;
+ esac
+}
+broker(){
+  case $1 in
+    start) su - eai -c "/opt/eai/bs/Broker/bin/broker_start localhost:$2";;
+    stop) su - eai -c "/opt/eai/bs/Broker/bin/broker_stop localhost:$2";;
+    status) su - eai -c "/opt/eai/bs/Broker/bin/broker_ping localhost:$2";;
+  esac
+}
+oracle_listener(){
+ test -f /opt/oracle/app/oracle/product/11.2.0/network/admin/listener.ora && case $1 in
+  stop) su - oracle -c "lsnrctl stop" | info -c oracle || error "Oracle stop KO";;
+  start) su - oracle -c "lsnrctl start" | info -c oracle || error "Oracle start KO";;
+  status) su - oracle -c "lsnrctl status";;
+ esac
+}
+_oracle_status(){
+  su - oracle -c "sqlplus -S / as sysdba <<EOF
+SET HEADING OFF
+SET FEEDBACK OFF
+set pagesize 0
+select STATUS from V\\\$INSTANCE;
+exit
+EOF
+"
+}
+oracle(){
+ test -f /opt/oracle/app/oracle/product/11.2.0/network/admin/listener.ora && case $1 in
+  stop) su - oracle -c "sqlplus / as sysdba <<EOT
+shutdown immediate;
+exit;
+EOT
+" || error oracle;;
+  start) su - oracle -c "sqlplus / as sysdba <<EOT
+startup;
+exit;
+EOT
+" || error oracle;;
+  status) oracle_status=`_oracle_status`
+    echo $oracle_status
+    test "x$oracle_status" = xOPEN;;
+ esac
+}
+
+ctmagent(){
+  case $1 in 
+    start) /opt/control/630/agent/ctm/scripts/start-ag -u ctmagent -p ALL && info -c ctmagent Start OK || error "ctmagent start KO";;
+    stop) /opt/control/630/agent/ctm/scripts/shut-ag -u ctmagent -p ALL && info -c ctmagent Stop OK || error "ctmagent stop KO";;
+    status) . /opt/control/630/agent/.profile
+	info -c ctmagent `/opt/control/630/agent/ctm/scripts/shagent`;;
+  esac
+}
+
+applications(){
+ info $1 applications
+
+ case $1 in
+ stop)
+  info "Stop of EAI service on `uname -n`"
+  hpom $1
+
+  # Stop the applications
+  is $1
+  james $1
+  interpel status && interpel $1
+  mws status && mws $1
+  brokermon status && brokermon $1
+
+  oracle_listener status && oracle_listener $1
+  oracle status && oracle $1
+
+  ctmagent $1
+ ;;
+
+ start)
+  ctmagent $1
+
+  ! oracle status && oracle $1
+  ! oracle_listener status && oracle_listener $1
+
+  ! brokermon status && brokermon $1 && sleep 10
+  ! mws status && mws $1
+  ! interpel status && interpel $1
+  james $1
+  is $1
+
+  hpom $1
+ ;;
+status)
+  hpom $1
+
+  trap 'kill $(jobs -p)' INT
+  ctmagent $1 &
+  oracle $1 &
+  oracle_listener $1 &
+  brokermon $1 &
+  mws $1 &
+  interpel $1 &
+  james $1 &
+  is $1 &
+
+  wait
+  ;;
+ esac
+}
+
+second_node(){
+  if expr `uname -n` : "eaiwbm[xp]01.*" >/dev/null; then
+    second_node=`uname -n | tr 1 2`
+    info "Execute $1 action on second node $second_node"
+    ssh $second_node /opt/eai/scripts/`basename $0` "$@" >/dev/stderr
+  fi
+}
+
+mountfs(){
+ case $1 in
+ stop)
+  # Unmount the FS (kill any process still using the FS)
+  #_umount_kill NFS || error "umount -t NFS KO"
+  #_umount_kill EAI || error "umount -t EAI KO"
+  for type in NFS `lsvg | grep -v rootvg` root; do
+    _umount_kill $type || error "umount -t $type KO"
+  done
+  ;;
+ start)
+# mount -f is not effective in this script (???)
+  for type in root `lsvg | grep -v rootvg`; do
+    if ! _is_type_mounted $type; then
+      mount -t $type && info "mount -t $type OK" || error "mount -t $type KO"
+    fi
+  done
+  sleep 2 && mount -t NFS && info "mount -t NFS OK" || warn "mount -t NFS KO"
+#  mount -a && info "mount -a OK" || error "mount -a KO"
+ ;;
+ status) 
+  for type in root `lsvg | grep -v rootvg` NFS root; do
+    _is_type_mounted $type
+  done;;
+ esac
+}
+export_import(){
+ case $1 in
+  stop)
+   for vg in `lsvg | grep -v rootvg`; do
+    info "exportvg $vg"
+    exportvg $vg || error "exportvg $vg KO"
+   done
+  ;;
+  start)
+   last_vg=""
+   grep -v rootvg /opt/eai/scripts/lspv.$logical_host |sort -k3 |while read hdisk pvid vg active; do
+    test "x$last_vg" = "x$vg" && continue
+    lsvg | grep $vg >/dev/null && continue
+    info "importvg -y $vg $pvid"
+    importvg -y $vg $pvid || error "importvg -y $vg $pvid"
+    last_vg="$vg"
+   done
+  ;;
+  status)
+   echo "lspv:"; lspv
+   echo; echo "Nominal PVs:"; cat /opt/eai/scripts/lspv.$logical_host
+   ;;
+  esac
+}
+vary(){
+ case $1 in
+ stop)
+  for vg in `lsvg -o | grep -v rootvg`; do
+    info "varyoffvg $vg"
+    varyoffvg $vg || error "varyoffvg $vg KO"
+  done
+  ;;
+ start)
+  for vg in `lsvg | grep -v rootvg`; do
+    info varyonvg $vg
+    varyonvg $vg || error "varyonvg $vg KO"
+  done
+   ;;
+  status)
+   lsvg `lsvg`;;
+ esac
+}
+  
+all(){
+ info "$1 of EAI service on `uname -n`"
+ case $1 in
+ stop) 
+  second_node $1
+
+  applications $1
+
+  # Remove the IP for the applications
+  ip $1
+
+  mountfs $1
+
+#  echo "Save lspv in /opt/eai/scripts/lspv"
+  test -f /opt/eai/scripts/lspv.$logical_host || lspv > /opt/eai/scripts/lspv.$logical_host
+
+  vary $1
+
+  export_import $1
+;;
+
+ start)
+  # Add the IPs for the applications
+  ip $1
+
+  export_import $1
+
+  vary $1
+
+  mountfs $1
+
+  # Start the applications
+  applications $1
+
+  second_node $1
+ ;;
+
+ status)
+  ip $1 &
+
+  mountfs $1 &
+
+  applications $1 &
+
+  second_node $1 &
+
+  wait
+;;
+
+  *) help
+    error "Incorrect argument";;
+ esac
+}
+
+case $# in
+  2) $1 $2;;
+  1) all $1;;
+  *) echo "Incorrect arguments"; help; exit 1;;
+esac

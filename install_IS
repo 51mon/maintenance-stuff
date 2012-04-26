@@ -1,0 +1,227 @@
+#!/bin/bash
+
+log(){ echo `date '+%Y-%m-%d %H:%M:%S'` [`basename $0`] "$@"; logger -t `basename $0` -p user.$@; }
+error(){ log error "$@"; exit 1; }
+warn(){ log warning "$@"; }
+info(){ log info "$@"; }
+
+usage(){ 
+  echo "Usage: $0 stage n is_name broker_host os_eai_password db_host db_port sid db_pass mws_db_host mws_db_sid mws_db_pass admin_password master_password role
+	ex: DEV 14 supply_rc localhost manage localhost 1530 EAID1 wmsupply_rc localhost EAID1 turnip radish 4sfgR3 Primary"
+  exit
+}
+
+test "x$install_dir" = x && error "install_dir variable not defined"
+test -d $install_dir || error No $install_dir
+
+cd $install_dir/SoftwareAG/ || error cd $install_dir/SoftwareAG/
+
+image_file=wM82_AIX_Full.zip
+
+wm_dir=/opt/eai
+test -d $wm_dir || error wm_dir $wm_dir KO
+
+test $# -eq 15 || { echo "Nb of args incorrect: $@"; usage; }
+stage="$1"
+n=$2
+is_port=${n}010
+is_name="$3"
+is_dir=$wm_dir/is/$is_name
+test -d $is_dir || mkdir -p $is_dir || error "mkdir -p $is_dir KO"
+test -w $is_dir || error "$is_dir not writable"
+broker_name=BRK_`echo $is_name | tr [:lower:] [:upper:]`
+bs_port=${n}019
+bs_host="$4"
+os_eai_user=eai
+os_eai_pass="$5"
+db_host="$6"
+db_port="$7"
+sid="$8"
+#sys_pass="$9"
+# WARNING I think the install script expects URL encoded values !! Don't use special characters
+db_pass="${9}"
+
+mws_db_host="${10}"
+mws_db_sid="${11}"
+mws_db_user=mws
+mws_db_pass=`echo -n "${12}" | sudo openssl enc -base64`
+mws_db_pass=`echo -n "$mws_db_pass" | sudo openssl enc -base64`
+
+admin_password=${13}
+master_password=${14}
+role="${15}"
+
+info "Check sudo (type $os_eai_user password if asked)"
+sudo -l >/dev/null || error sudo KO
+sudo id | grep root || error sudo KO
+
+
+info Install with params $@
+
+test $role = Primary && node=1 || node=2
+db_is_user=WMIS$node$is_name
+db_tn_user=WMTN$is_name
+
+if test -d $is_dir/IntegrationServer; then
+  info "the folder $is_dir/IntegrationServer exists, skipping the IS install"
+else
+  info Setup the install script with the specific paramters
+  script=install_script_IS_template
+  new_script=$script$n
+  license_encoded=`echo $(pwd)/pie82.xml | sed 'sµ/µ%2Fµg'`
+  sed "s/DBHOST/$db_host/g; 
+s/URLENCODEDLICENSE/$license_encoded/;
+s/DBPORT/$db_port/g; 
+s/DBSID/$sid/g; 
+s/ISDBUSER/WMIS/g; 
+s/ISDBPASS/$db_pass/g; 
+s/TNDBUSER/$db_tn_user/g; 
+s/TNDBPASS/$db_pass/g; 
+s/ISPORT/$is_port/g; 
+s|ISFOLDER|$is_dir|g;
+s|IMAGEFILE|$image_file|;" $script > $new_script
+  java -jar SoftwareAGInstaller201104.jar -readScript $new_script -console || error IS install KO
+  rm $new_script
+  info Setup Central User Management
+  jdbc_dir=$is_dir/IntegrationServer/config/jdbc
+  pool_dir=$jdbc_dir/pool
+  sed "s/$db_host/$mws_db_host/;
+s/$sid/$mws_db_sid/;
+s/.*<\/byte>/$mws_db_pass    <\/byte>/; 
+s/ISPOOL/MWS/; 
+s/userid\">.*<\/value/userid\">$mws_db_user<\/value/" $pool_dir/ISPOOL.xml > $pool_dir/MWS.xml
+  sed 's/<null name="connPoolAlias"\/>/<value name="connPoolAlias">MWS<\/value>/' $pool_dir/../function/CentralUsers.xml > /var/tmp/CentralUsers.xml && mv /var/tmp/CentralUsers.xml $pool_dir/../function/CentralUsers.xml
+
+  # Divide schemas as SAG requested
+  jdbc_dir=/opt/eai/is/$is_name/IntegrationServer/config/jdbc
+  test -d $jdbc_dir || error "$jdbc_dir not found"
+  sed "s/ISPOOL/CORE/; s/WMIS/WMCORE$is_name/" $pool_dir/ISPOOL.xml > $pool_dir/CORE.xml
+  sed "s/ISPOOL/Internal$node/; s/WMIS/WMIS$node$is_name/" $pool_dir/ISPOOL.xml > $pool_dir/Internal$node.xml
+  sed "s/ISPOOL/$db_tn_user/" $pool_dir/ISPOOL.xml > $pool_dir/TN.xml
+
+  sed "s/ISPOOL/Internal$node/" $jdbc_dir/function/ISInternal.xml > /var/tmp/ISInternal.xml && mv /var/tmp/ISInternal.xml $jdbc_dir/function/ISInternal.xml
+  for s in ISCoreAudit Xref DocumentHistory ProcessAudit ProcessEngine; do
+    sed "s/ISPOOL/CORE/" $jdbc_dir/function/$s.xml > /var/tmp/$s.xml && mv /var/tmp/$s.xml $jdbc_dir/function/$s.xml
+  done
+  sed "s/ISPOOL/TN/" $jdbc_dir/function/TN.xml > /var/tmp/TN.xml && mv /var/tmp/TN.xml $jdbc_dir/function/TN.xml
+
+  info Adding AIX specific paramters
+  echo "
+AIXTHREAD_SCOPE=S
+AIXTHREAD_MUTEX_DEBUG=OFF
+AIXTHREAD_COND_DEBUG=OFF
+AIXTHREAD_RWLOCK_DEBUG=OFF
+SPINLOOPTIME=500
+export AIXTHREAD_SCOPE AIXTHREAD_MUTEX_DEBUG AIXTHREAD_COND_DEBUG AIXTHREAD_RWLOCK_DEBUG SPINLOOPTIME
+ulimit -d unlimited
+ulimit -m unlimited
+ulimit -n unlimited
+ulimit -s unlimited" >> $is_dir/IntegrationServer/bin/setenv.sh
+
+  server_cnf=$is_dir/IntegrationServer/config/server.cnf
+  sed "s/watt.server.threadPool=75/watt.server.threadPool=200/; " $server_cnf > $server_cnf.tmp && mv $server_cnf.tmp server_cnf
+fi
+
+sed 's/"-Dsun\.lang/"-Xms512M -Xmx1536M -Dsun\.lang/' $is_dir/IntegrationServer/bin/server.sh > /var/tmp/server.sh && mv /var/tmp/server.sh $is_dir/IntegrationServer/bin/server.sh
+
+
+if test "$role" = Primary; then
+  info "DB (Oracle) part (using DB configurator)"
+
+  test -d $is_dir/common/db || error $wm_dir/opt/eai/$is_dir/common/db KO
+#  ./create_wm_schema $is_dir/common/db $db_host $db_port $sid IS $db_is_user $db_pass || error create_wm_schema KO
+  ./create_IS_schema $is_dir/common/db $db_host $db_port $sid $is_name "$db_pass" || error ./create_IS_schema KO
+fi
+
+info SAP JCO part
+test -f $is_dir/IntegrationServer/lib/libsapjco3.so || cp libsapjco3.so $is_dir/IntegrationServer/lib/
+WmSAP_static=$is_dir/IntegrationServer/packages/WmSAP/code/jars/static
+test -f $WmSAP_static/sapjco3.jar || cp sapjco3.jar $WmSAP_static
+test -f $is_dir/IntegrationServer/lib/sapjco3.jar || cp sapjco3.jar $is_dir/IntegrationServer/lib/
+test -f $WmSAP_static/sapidoc3.jar || cp sapidoc3.jar $WmSAP_static
+test -f $is_dir/IntegrationServer/replicate/inbound/SAP_7.1_Fix5.zip || cp SAP_7.1_Fix5.zip $is_dir/IntegrationServer/replicate/inbound/
+# Needed ...
+test -f $is_dir/IntegrationServer/lib/sapidoc3.jar || cp sapidoc3.jar $is_dir/IntegrationServer/lib/
+
+if test `egrep -c watt.server.frmk.env $is_dir/IntegrationServer/config/server.cnf` -eq 0; then
+  echo "watt.server.frmk.env=$stage" >> $is_dir/IntegrationServer/config/server.cnf
+fi
+
+is_stopped(){ test `sudo lsof | grep -c ":$is_port (LISTEN)"` -eq 0; }
+if is_stopped; then
+  info Start IS
+  chmod +x $is_dir/IntegrationServer/bin/server.sh || error "chmod +x $is_dir/IntegrationServer/bin/server.sh KO"
+  nohup $is_dir/IntegrationServer/bin/server.sh &
+#  $wm_dir/scripts/wm_is start $is_dir || error "IS start KO"
+#  check_is_port(){ test `nb_start_logs` -gt $1; }
+#  while check_is_port $nb_start_logs; do info Still waiting for IS start...; sleep 5; done
+  i=0; while is_stopped; do i=`expr $i + 1`; test $i -gt 40 && error "IS doesn't start"; info "Still waiting for IS start..."; sleep 5; done
+  info IS started
+else
+  info Port $is_port already listening
+fi
+
+server_sh="$is_dir/IntegrationServer/bin/server.sh"
+if test `egrep -c eai.stage $server_sh` -eq 0; then
+  info "Add the stage property in the JVM"
+  sed "s/Syntax=true\"/Syntax=true -Dcom.total.eai.stage=$stage\"/" $server_sh > $server_sh.tmp && mv $server_sh.tmp $server_sh
+fi
+
+info "Copy the ojdbc jar"
+if test ! -f $is_dir/IntegrationServer/lib/jars/ojdbc6.jar; then
+  cp ojdbc6.jar $is_dir/IntegrationServer/packages/WmJDBCAdapter/code/jars || error "cp ojdbc6.jar KO"
+fi
+
+if test ! -f $is_dir/data; then
+  info "Create the link to the /data into $is_dir"
+  ln -s /data $is_dir/data
+fi
+
+info "remove read on master password & outbound passwords"
+chmod go-r $is_dir/IntegrationServer/config/empw.dat $is_dir/IntegrationServer/config/txnPassStore.dat
+
+
+if curl -u Administrator:manage "http://localhost:$is_port" 2>&1 | grep body >/dev/null; then
+  info "update new Administrator password"
+  curl -u Administrator:manage "http://localhost:$is_port/invoke/wm.server.access/userUpdate?username=Administrator&password=$admin_password"
+
+  CLASSPATH="$is_dir/common/lib/wm-isclient.jar:$is_dir/common/lib/ext/mail.jar:$is_dir/common/lib/ext/enttoolkit.jar:."
+  java=$is_dir/jvm/jvm160_64/bin/java
+
+ if test "x$broker_host" != x; then
+  info "Check broker connection ConfigureBrokerOnIS localhost:$is_port Administrator xxxx"
+  if $java -cp $CLASSPATH ConfigureBrokerOnIS localhost:$is_port Administrator "$admin_password"; then
+    info "The connection of the IS to the broker is OK"
+  else
+    info "Setup the IS broker connection" 
+# (and restart the IS)"
+    $java -cp $CLASSPATH ConfigureBrokerOnIS localhost:$is_port Administrator "$admin_password" $bs_host:$bs_port ${broker_name} ${broker_name}_ "$os_eai_user" "$os_eai_pass" && sleep 2
+    chmod +x $is_dir/IntegrationServer/bin/server.sh
+    $wm_dir/scripts/wm_is restart $is_dir || error "IS restart KO"
+
+#  while is_stopped; do info Still waiting for IS start...; sleep 5; done
+  fi
+ fi
+
+  info import WmSAP fix
+  curl -u Administrator:$admin_password "http://localhost:$is_port/invoke/pub.packages/installPackage?packageFile=SAP_7.1_Fix5.zip&activateOnInstall=yes"
+
+  if test `egrep -c "${n}011|${n}012" $is_dir/IntegrationServer/packages/WmRoot/config/listeners.cnf` -ne 5; then
+    info "Setup the ports for Diagnostics & PRT"
+    $java -cp $CLASSPATH ConfigurePorts $is_host:$is_port Administrator "$admin_password" ${n}011 ${n}012
+  fi
+
+  info "Remove expiration of 90 days on master passswords"
+  curl -u Administrator:$admin_password "http://localhost:$is_port/invoke/wm.server.internalOutboundPasswords/setMasterExpireInterval?expireInterval=0&action=updateInterval"
+
+  info "update new master password"
+  curl -u Administrator:$admin_password "http://localhost:$is_port/invoke/wm.server.internalOutboundPasswords:rawMasterUpdate?oldPassword=manage&newPassword=$master_password&action=updateMaster"
+
+  info "Setup Process Engine JMS connection to broker, activate it and reload WmPRT"
+  curl -u Administrator:$admin_password "http://localhost:$is_port/invoke/wm.server.jms/updateConnectionAlias?aliasName=PE_NONTRANSACTIONAL_ALIAS&description=system%20generated%20JMS%20connection%20alias&transactionType=0&clientID=DEFAULT_IS_JMS_PE_CLIENT&user=$os_eai_user&password=$os_eai_pass&associationType=1&nwm_brokerHost=$bs_host:$bs_port&nwm_brokerName=${broker_name}&nwm_clientGroup=IS-JMS&optTempQueueCreate=on" || error "Process Engine JMS connection KO"
+  curl -u Administrator:$admin_password "http://localhost:$is_port/WmRoot/settings-jms.dsp?action=changeState&aliasName=PE_NONTRANSACTIONAL_ALIAS&setEnabled=true"
+  curl -u Administrator:$admin_password "http://localhost:$is_port/WmRoot/package-list.dsp?action=reload&package=WmPRT" >/dev/null || error "Reload of WmPRT KO"
+
+  curl -u Administrator:$admin_password "http://localhost:$is_port/invoke/wm.server.ed/syncWithBroker?all=yes" || error "Sync of docs KO"
+
+fi

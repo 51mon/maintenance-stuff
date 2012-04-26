@@ -1,0 +1,297 @@
+#!/bin/bash 
+# Script to stop/start/check the IS
+# Check also the broker and database (through SQLPLUS)
+
+# Disable debug when executed by Controlm
+set -
+
+script_dir=/opt/eai/scripts
+
+# OS specific settings
+case `uname` in
+AIX) find=/opt/freeware/bin/find
+     default_path=/opt/eai/is
+     broker_cfg=/opt/eai/bs/Broker/bin/awbrokermon.cfg;;
+*) find=/usr/local/bin
+   default_path=/produits/wm6/wm61
+   broker_cfg=/data/wm61/config/broker/awbrokermon.cfg;;
+esac
+
+usage(){
+  echo "Usage: `basename $0` stop|start|status|restart IS_folder [IS_folder2] [IS_folder3] ..."
+  echo 	ex: `basename $0` stop /opt/eai/is/lub
+  echo  ex: `basename $0` status /opt/eai/is
+  exit
+}
+
+pid_on_file(){
+  _pid=`fuser $1 2>/dev/null`
+  test "x$_pid" != x && echo $_pid
+}
+
+is_up(){
+#  last_log(){ ls -1rt $1 2>/dev/null | tail -1; }
+#  last_log=`last_log $1`
+  test -f $1 || return $?
+  pid=`pid_on_file $1`
+#lsof -p 458870 2>/dev/null|grep -c ":1030 *(LISTEN"
+}
+
+start(){
+  log="$1"; shift
+  # This value is a FUNCTION because we must get the current value at each iteration
+  script="$1"; shift
+  log_started="$1"; shift
+  interval=$1; shift
+  max_retries=$1; shift
+
+    nb_startlog(){ 
+      test -f $log || { echo 0; return; }
+      grep -c "$log_started" $log
+    }
+    nb_startlog_before=`nb_startlog`
+
+    chmod +x $script
+    if test `id |sed 's/).*//; s/.*(//'` = root; then 
+      su - eai -c "nohup $script >`dirname $log`/nohup_`date '+%Y%m%d'`.out 2>&1 &"
+    else
+      nohup $script >`dirname $log`/nohup_`date '+%Y%m%d'`.out 2>&1 &
+    fi
+    sleep $interval
+    if pid=`pid_on_file "$log"`; then
+      info "Process $pid started ($log)"
+    else
+      sleep $interval; sleep $interval
+      pid=`pid_on_file "$log"` || error "No process present after executing $script"
+    fi
+
+    retry=0; while true; do
+      # If the number of start logs decrease => the log file changed
+      test `nb_startlog` -lt $nb_startlog_before && nb_startlog_before=0
+      test `nb_startlog` -gt $nb_startlog_before && { info "Detected \"$log_started\" into $log"; break; }
+      retry=`expr $retry + 1`
+      test $retry -gt $max_retries && error "Not started after $retry retries ($log)"
+      test `expr $retry % 4` -eq 0 && info "$retry out of $max_retries. Waiting for \"$log_started\" in $log, last log: `tail -1 $log`"
+      sleep $interval
+    done
+}
+
+stop(){
+  log="$1"; shift
+  interval=$1; shift
+  max_retries=$1; shift
+
+  if pid=`pid_on_file "$log"`; then
+    info "Terminate $pid"
+    kill $pid
+    retry=0; while true; do sleep $interval
+      pid_on_file "$log" >/dev/null || { info "The process $pid is stopped ($log)"; break; }
+      retry=`expr $retry + 1`
+      if test $retry -gt $max_retries; then
+        warn "Process $pid still present after $max_retries x $interval seconds, SIGKILL"
+        kill -9 $pid
+        pid_on_file "$log" && error "Process $pid still present after sigkill ($log)"
+        info "Process $pid stopped by sigkill ($log)"
+        break
+      fi
+      test `expr $retry % 4` -ne 0 || info "$retry out of $max_retries. Waiting the process to stop"
+    done
+  else
+    info "No process is present"
+  fi
+}
+
+sql(){
+#  ora_home=`egrep "^oracle" /etc/passwd | cut -d':' -f6`
+#  test -f $ora_home/.profile && . $ora_home/.profile 2>/dev/null || error "Can't access Oracle profile"
+#  sid=$1
+  _sql(){
+    case `uname -n` in
+      watdtt*) sqlplus_options=ISPOOL/ISPOOL@`oracle_sid "$1"`;;
+      eaiwbm*|eaimon*|eaicol*) sqlplus_options=/;;
+      *) sqlplus_options=HPOV/HPOV@$sid;;
+    esac
+    ssh -T -o "CheckHostIP no" `oracle_host "$1"` <<EOS
+. .profile
+sqlplus -S $sqlplus_options <<EOF
+SET HEADING OFF
+SET FEEDBACK OFF
+set pagesize 0
+$2;
+exit
+EOF
+EOS
+  }
+  { _sql "$@" || error "sqlplus $sqlplus_options KO"; } |egrep -v "^$"
+}
+
+auditDbFile(){
+  grep connPoolAlias $1/config/jdbc/function/ISCoreAudit.xml \
+    | sed 's/.*connPoolAlias">//; s/<\/value.*//'
+}
+oracle_sid(){
+  grep dbURL "$1/config/jdbc/pool/`auditDbFile $1`.xml" | sed 's/.*=//; s/ *[<;].*//'
+}
+oracle_host(){
+  grep dbURL "$1/config/jdbc/pool/`auditDbFile $1`.xml" | sed 's/.*:\/\///; s/:.*//'
+}
+oracle_port(){
+  grep dbURL "$1/config/jdbc/pool/`auditDbFile $1`.xml" | sed 's/.*://; s/;.*//'
+}
+oracle_db_status(){
+  is_path="$1"
+  sid=`oracle_sid "$is_path"`
+  # To access: GRANT SELECT ON v_$instance TO PUBLIC
+  sql "$is_path" "select STATUS from V\\\$INSTANCE where INSTANCE_NAME = '$sid'"
+}
+is_oracle_port_listening(){
+  host=`oracle_host $1`
+  port=`oracle_port $1`
+  java -cp $script_dir ProbePort $host $port >/dev/null \
+    && info "Oracle $host:$port is listening" \
+    || { log WARN "Oracle $host:$port is not listening"; return 1; }
+}
+is_oracle_open(){ 
+  status=`oracle_db_status "$1"`
+  test "x$status" = xOPEN && info "DB is open" || { log WARN "DB is not open ($status)"; return 1; }
+}
+
+wm_version(){
+  test -f $1/common/lib/client61.jar && echo 61 || echo 82
+}
+
+is_port(){
+  #grep HTTPListener $1/packages/WmRoot/config/listeners.cnf | egrep "@.*010" | sed 's/.*@//; s/["<].*//' |uniq
+  sed 's/[<>@]/"/g' $1/packages/WmRoot/config/listeners.cnf \
+    | awk -F'"' '{if($3 == "default" && $5 == "include"){a=1}; if(a == 1 && $5 == "HTTPListener"){print $6; a=0}}'
+}
+
+# Label to identify the object we are working on
+obj=null
+
+log(){ echo `date '+%Y-%m-%d %H:%M:%S'` [`basename $0` ${action} ${obj}] "$@"; \
+	logger -t `basename $0`_${action}_${obj} -p user.$@; }
+error(){ log error "$@"; exit 1; }
+warn(){ log warn "$@"; }
+info(){ log info "$@"; }
+
+check_broker(){
+  is_path="$1"
+  test -f $broker_cfg || { log WARN "File $broker_cfg not present, can't check broker"; return; }
+  dispatch="$is_path/config/dispatch.cnf"
+  host=`grep brokerHost $dispatch |sed 's/:.*//; s/.*>//'` || error "with $dispatch"
+  port=`grep brokerHost $dispatch |sed 's/.*://; s/<.*//'` || error "with $dispatch"
+
+  broker_path=`awk -F"=" '{if ($1 ~ "server-" port ".datadir"){print $2}}' port=$port $broker_cfg`
+  if test -d $broker_path; then
+    broker_queue_storage=`find $broker_path -name Broker\*.qs |head -1`
+    if pid=`pid_on_file "$broker_queue_storage"`; then 
+      info "Broker $broker_path is started locally (pid $pid)"
+    else
+      log WARN "Broker $broker_path is stopped (no process on $broker_path/Broker.qs)"
+      return 1
+    fi
+  else
+    info "No broker files found locally"
+  fi
+  java -cp $script_dir ProbePort $host $port >/dev/null && info "Broker $host:$port is listening"
+}
+
+check_application_by_file_used(){
+  pid=`pid_on_file "$1"` && info "$2 is started (pid $pid)" || info "$2 is stopped"
+}
+
+
+main(){
+# Remove ending /
+path=`echo $2 | sed 's/\/$//'`
+action=$1
+
+# log DEBUG Action $action && exit
+
+obj=`is_port $path`
+
+case `wm_version $path` in
+61) is_log="$path/logs/server`date '+%Y%m%d'`.log"
+    db_user=HPOV
+    db_pass=HPOV;;
+82) is_log="$path/logs/server.log"
+    db_user=wm$name
+    ;;
+*) error "No wm_version";;
+esac
+#current_is_log(){ echo "$is_log`date '+%Y%m%d'`.log"; }
+repo_log="$path/reposerver/logs/repo`date '+%Y%m%d'`.log"
+#current_repo_log(){ echo "$repo_log`date '+%Y%m%d'`.log"; }
+
+case $action in
+status)
+  check_broker $path
+  is_oracle_open $path
+  is_oracle_port_listening $path
+  test -f $path/config/licenseKey.xml || check_application_by_file_used "$repo_log" Repository
+  check_application_by_file_used "$is_log" IS;;
+start) 
+  check_broker $path
+  { is_oracle_open $path && is_oracle_port_listening $path; } || error "The DB declared into the audit pool is not available"
+  test `wm_version` = 61 && start "$repo_log" current_repo_log $path/reposerver/bin/repostore.sh "Repository Server registered, waiting for work...." 3 3
+  if pid=`pid_on_file "$is_log"`; then
+    info "Process $pid found ($is_log)"
+  else
+    test -f $path/LOCKFILE && warn "LOCKFILE found, removing it" && rm $path/LOCKFILE
+    start "$is_log" "$path/bin/server.sh" "Initialization completed in" 20 60
+  fi
+  ;;
+stop)
+  pid=`pid_on_file "$is_log"` || { info "No process found"; exit; }
+  stop "$is_log" 5 12
+  i=0; while test -f $path/LOCKFILE; do
+    sleep 1
+    i=`expr $i + 1` && test $i -gt 30 && warn "$path/LOCKFILE still present" && break
+  done
+  test `wm_version` = 61 && stop "$repo_log" 2 5 || true;;
+restart)
+  $0 stop $path
+  $0 start $path;;
+*) error $2 arg not expected;;
+esac
+
+}
+
+
+# Analyse arguments to launch the main
+# Default
+action=status
+path=$default_path
+
+test $# -ne 0 && { action=$1; shift; }
+
+test $# -ne 0 && path="$@"
+
+is_dirs=""
+for dir in $path; do
+  test -d $dir || error "No $dir folder"
+  if test `basename $dir` = IntegrationServer; then
+    is_dirs="$is_dirs $dir"
+  else
+    is_dirs="$is_dirs `$find $dir -maxdepth 2 -name IntegrationServer | xargs`"
+  fi
+done
+# Multi IS case
+if test `echo $is_dirs | wc -w` -gt 1; then
+  info "Process the components $is_dirs"
+  trap 'kill $(jobs -p)' INT
+  for is_dir in $is_dirs; do
+    obj=multi
+    test -d $is_dir/packages && test -d $is_dir/bin || continue
+    main $action "$is_dir" &
+  done
+  info "The actions are started, wait for the end"
+  wait
+  info "The actions have ended"
+  exit
+else
+  test `basename $path` = IntegrationServer || path="$path/IntegrationServer"
+  main $action "$path"
+fi
+

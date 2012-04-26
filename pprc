@@ -1,0 +1,191 @@
+#!/bin/bash
+set -o pipefail
+
+script="$0"
+script_name=`basename $0`
+
+help(){
+  echo "Description: Script for disaster recovery (with PPRC Peer to Peer Remote Copy), 
+	to switch Data Storage between primary and backup sites
+
+Usage: 	$script_name switch|pause|resume|failover|failback|details to_backup|to_primary
+
+1st argument:
+	switch		Does the full switch procedure (planned DRP):
+			1) Pause the replication (if the source storage is available),
+			2) Failover (Set the backup storage as primary), 
+			3) Failback (Activate replication on the new backup) (if the source storage is available)
+	pause	 	Pauses the replication on the backup storage
+	failover	Changes the active storage
+	failback	Activates the replication
+
+2nd argument:
+	to_backup	From primary storage to backup storage
+	to_primary	From backup storage to primary storage
+
+Examples: 
+	$script_name switch to_backup	switch the storage on the backup storage
+	$script_name switch to_primary	switch the storage on the primary storage
+	$script_name pause to_backup	pause the replication from the primary storage to the secondary
+	$script_name failover to_backup	sets the backup storage as primary
+	$script_name failback to_backup 	activates replication from the backup storage to the primary
+
+When the primary site is unavailable, the procedure is:
+	$script_name failover to_backup
+	# Start the applications and open the service on the backup site
+	# Wait until the primary site is available again
+	$script_name failback to_backup
+	# On the top of the management we return on the primary site
+	# Stop the applications on the backup site
+	$script_name pause to_primary
+	$script_name failover to_primary
+	$script_name failback to_primary
+	# Start the applications and open the service on the primary site"
+}
+
+if . /opt/eai/scripts/ref; then
+  :
+else
+  log(){ echo `date` $@ >/dev/stderr; }
+  alias info=log
+  error(){ log $@; exit 1; }
+fi
+
+# Build parameters
+DSCLY=ibm.2107-75wc781
+DSPLD=ibm.2107-75wb561
+DSCLY_HMC_IP=10.134.8.45
+DSPLD_HMC_IP=10.134.8.43
+
+dscli(){
+  hmc="$1"; shift
+#  info "dscli $@"
+  /opt/ibm/dscli/dscli -hmc1 $hmc -user unix -passwd "arist0te" $@ || error "dscli command KO"
+}
+
+ 
+
+DS_name(){ 
+  case $1 in
+    ibm.2107-75wc781) echo CLY;;
+    ibm.2107-75wb561) echo PLD;;
+  esac
+}
+
+case `uname -n` in
+ eaiwbmp*)
+  DS1="$DSCLY"
+  DS2="$DSPLD"
+  HMC1="$DSCLY_HMC_IP"
+  HMC2="$DSPLD_HMC_IP"
+  LUNs_1_to_2="1911:1900 1912:1901 1913:1902 1914:1903 1915:1904 1916:1905 1917:1906 1918:1907 1919:1908 191A:1909 191B:190A 191C:190B 191D:190C 191E:190D 191F:190E 1920:190F 1921:1910 1922:192C 1923:192D 1924:192E 1925:192F 1926:1930 1927:1931 1928:1932 1929:1933 192A:1934 192B:1935 1A11:1A00 1A12:1A01 1A13:1A02 1A14:1A03 1A15:1A04 1A16:1A05 1A17:1A06 1A18:1A07 1A19:1A08 1A1A:1A09 1A1B:1A0A 1A1C:1A0B 1A1D:1A0C 1A1E:1A0D 1A1F:1A0E 1A20:1A0F 1A21:1A10 1A22:1A28 1A23:1A29 1A24:1A2A 1A25:1A2B 1A26:1A2C 1A27:1A2D"
+  ;;
+ eaiwbmx*) 
+  DS1="$DSPLD"
+  DS2="$DSCLY"
+  HMC1="$DSPLD_HMC_IP"
+  HMC2="$DSCLY_HMC_IP"
+  #LUNs_1_to_2="17D3:1737 17D4:1738 17D5:1739 17D8:1743 17D9:1744 17DA:1745 1800:1837 1801:1838 1802:1839 1803:1873 1804:1874 1805:1844 1806:1845 1807:1846 1808:1867 1809:1868 181A:1869 181B:186A 181C:1850 181D:1851 181E:1852 181F:1853 1820:1854 1821:1855 1822:1830 1823:1831 1824:1832 1825:1833 1826:1834 1827:1835 1828:1856 1829:1857 182A:1858 182B:1859 182C:186B 182D:186C 182E:186D 182F:186E 1830:186F 1831:1870 1832:185A 1833:185B 1834:185C 1835:185D 1836:185E 1837:185F 1838:1860 1839:1861 183B:1871 183C:1872 1853:1847 1860:18A3 1861:18A4"
+  LUNs_1_to_2="17D3:1737 17D4:1738 17D5:1739 17D8:1743 17D9:1744 17DA:1745 1800:1837 1801:1838 1802:1839 1803:1873 1804:1874 1805:1844 1806:1845 1807:1846 1808:1867 1809:1868 181A:1869 181B:186A 181C:1850 181D:1851 181E:1852 181F:1853 1820:1854 1821:1855 1822:1830 1823:1831 1824:1832 1825:1833 1826:1834 1827:1835 1828:1856 1829:1857 182A:1858 182B:1859 182C:186B 182D:186C 182E:186D 182F:186E 1830:186F 1831:1870 1832:185A 1833:185B 1834:185C 1835:185D 1836:185E 1837:185F 1838:1860 1839:1861 183B:1871 183C:1872 1853:1847"
+  ;;
+ *) echo "Host not managed";;
+esac
+
+LUNs_2_to_1=`echo $LUNs_1_to_2 | sed 's/\(....\):\(....\)/\2:\1/g'`
+
+LUNs_1=`echo $LUNs_1_to_2 | sed 's/....://g'`
+LUNs_2=`echo $LUNs_1_to_2 | sed 's/:....//g'`
+
+# Start of the actions
+if test x$1 != xdetails; then
+  { test $# -eq 2 || test $# -eq 3; } || { help; exit 1; }
+
+  case $2 in
+  to_backup) 
+    src_DS=$DS1
+    tgt_DS=$DS2
+    src_HMC=$HMC1
+    tgt_HMC=$HMC2
+    LUN_pairs="$LUNs_1_to_2"
+    LUN_pairs_reverse="$LUNs_2_to_1"
+  ;;
+  to_primary) 
+    src_DS=$DS2
+    tgt_DS=$DS1
+    src_HMC=$HMC2
+    tgt_HMC=$HMC1
+    LUN_pairs="$LUNs_2_to_1"
+    LUN_pairs_reverse="$LUNs_1_to_2"
+  ;;
+  *) echo "Incorrect 2nd arg"; help ;;
+  esac
+
+  info "$@ from device $src_DS (`DS_name $src_DS`) to $tgt_DS (`DS_name $tgt_DS`)"
+fi
+
+main(){
+ case $1 in
+  details) info "Primary storage image = $DS1 (`DS_name $DS1`), secondary = $DS2 (`DS_name $DS2`)";;
+  switch) 
+    main details
+    echo
+    main pause $2 || exit $?
+    echo
+    main failover $2 || exit $?
+  ;;
+  pause) 
+    main is_status $2 "Full Duplex" || error "Problem with the synchro"
+
+    main wait_status $2 "Full Duplex"
+
+    dscli $src_HMC pausepprc -dev $src_DS -remotedev $tgt_DS $LUN_pairs
+
+    main wait_status $2 Suspended
+  ;;
+  resume)
+    test $# -eq 3 && _pairs="$3" || _pairs="$LUN_pairs"
+    dscli $src_HMC resumepprc -dev $src_DS -remotedev $tgt_DS -type mmir $_pairs
+
+    main wait_status $2 "Full Duplex"
+  ;;
+  ls) dscli $src_HMC lspprc -l -dev $src_DS -remotedev $tgt_DS $LUN_pairs;;
+  status) main ls $2 | awk '{print substr($0,0,54)}';;
+  nb_status) main ls $2 | egrep -cv "^dscli|^/opt|^ID|^=======|^Date| $3 ";;
+  is_status) nb_volumes=`main nb_status $2 "$3"`
+    test $nb_volumes -eq 0 && info "All volumes are in $3" || warn "$nb_volumes are not in state $3";;
+  wait_status) 
+    retries=0
+    while ! main is_status $2 "$3"; do
+      nb_volumes=`main nb_status $2 "$3"`
+      info "$nb_volumes volumes still not synchronised in $3"
+      sleep 5
+      retries=`expr $retries + 1`
+      test $retries -lt 10 || error "Sync KO"
+    done
+  ;;
+  failover) 
+    dscli $tgt_HMC failoverpprc -dev $tgt_DS -remotedev $src_DS -type mmir $LUN_pairs_reverse
+
+    case $2 in
+    to_backup) main is_status to_primary "Suspended";;
+    to_primary) main is_status to_backup "Suspended";;
+    esac
+  ;;
+  failback) 
+    case $2 in
+    to_backup) main is_status to_primary "Full Duplex";;
+    to_primary) main is_status to_backup "Full Duplex";;
+    esac
+
+    dscli $tgt_HMC failbackpprc -dev $tgt_DS -remotedev $src_DS -type mmir $LUN_pairs_reverse
+
+    case $2 in
+    to_backup) main wait_status to_primary "Full Duplex";;
+    to_primary) main wait_status to_backup "Full Duplex";;
+    esac
+  ;;
+  *) help;;
+ esac
+}
+
+main "$@"

@@ -1,0 +1,35 @@
+#!/usr/bin/expect --
+
+send "Connecting to POP3 on James as delta user\n"
+set timeout [ expr 2 * 60 * 60 ]
+set max 100
+proc p {message} { send_user "### $message\n" }
+proc pop_expect {} {
+  expect {
+    "+OK" { return 0 }
+    -ex "-ERR" { exit 1 }
+    default { send_error "Timeout\n"; exit 1 }
+  }
+}
+proc pop {cmd} {
+  send "$cmd\r"
+  pop_expect
+}
+spawn telnet localhost 11000
+pop_expect
+pop "USER delta"
+pop "PASS delta"
+pop "STAT"
+expect -re " (.+) .+\n"
+set count $expect_out(1,string)
+if { $count > $max } {
+  set max_dele [expr {$count - $max}]
+  p "$count mails > $max, flag $max_dele mails as deleted"
+  for {set i 1} {$i <= $max_dele} {incr i 1} {
+    pop "DELE $i"
+  }
+} else {
+  p "$count mails < $max"
+}
+send "QUIT\r"
+p "End of connection"
